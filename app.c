@@ -2,6 +2,32 @@
  * @file app.c
  * @brief Competition-ready 3-sensor PD line follower for EV3RT (TOPPERS).
  *
+ * Common EV3RT Compile Errors (and how they are avoided here)
+ * ===========================================================
+ *  1. Wrong headers -- e.g. including "ev3.h" or "pybricks.h" instead of
+ *     "ev3api.h".  We include only "app.h" which pulls in "ev3api.h".
+ *  2. Wrong API names -- e.g. motor_start(), set_sensor_mode(), nxt_motor().
+ *     We use ev3_motor_set_power(), ev3_color_sensor_get_reflect(), etc.
+ *  3. Wrong type constants -- e.g. EV3_LARGE_MOTOR, NXT_SENSOR.  Correct
+ *     EV3RT constants are LARGE_MOTOR and COLOR_SENSOR.
+ *  4. Wrong port constants -- e.g. PORT_1 or INPUT_1.  Correct EV3RT
+ *     constants are EV3_PORT_1 .. EV3_PORT_4 (sensors) and
+ *     EV3_PORT_A .. EV3_PORT_D (motors).
+ *  5. Using bool without <stdbool.h> -- ev3api.h does not guarantee bool.
+ *     We use plain int for boolean-like flags to be safe.
+ *  6. C99 mixed declarations -- declaring variables after statements inside
+ *     a block.  Some cross-compiler configurations default to C89/C90.
+ *     We declare all local variables at the top of each block.
+ *  7. Missing main_task prototype -- the TOPPERS configurator (app.cfg)
+ *     references main_task; it must be declared extern in app.h.
+ *  8. Forgetting ev3_sensor_config / ev3_motor_config -- sensors and motors
+ *     must be configured before first use or reads return garbage / motors
+ *     do not respond.
+ *  9. Wrong tslp_tsk units -- EV3RT (TOPPERS/HRP3) measures RELTIM in
+ *     microseconds, not milliseconds.  tslp_tsk(1000) = 1 ms.
+ * 10. Floating-point on ARM -- compiles fine with the EV3RT GCC toolchain
+ *     but double-precision may be slow.  We keep expressions simple.
+ *
  * Control Strategy
  * ================
  * The robot uses three color sensors arranged in a triangular formation
@@ -27,11 +53,26 @@
  *     left_motor  = base_speed + correction
  *     right_motor = base_speed - correction
  * and clamped to the valid EV3 power range [-100, 100].
+ *
+ * Compilation Checklist
+ * =====================
+ * - Required headers:
+ *     app.h  (must #include "ev3api.h")
+ * - Motor configuration:
+ *     ev3_motor_config(port, LARGE_MOTOR) for EV3_PORT_B and EV3_PORT_C
+ * - Sensor configuration:
+ *     ev3_sensor_config(port, COLOR_SENSOR) for EV3_PORT_1/2/3
+ * - app.cfg must contain:
+ *     INCLUDE("app_common.cfg");
+ *     CRE_TSK for main_task
+ * - app.h must:
+ *     #include "ev3api.h"
+ *     declare: extern void main_task(intptr_t exinf);
+ * - Makefile.inc must list:
+ *     APPL_COBJS += app
  */
 
 #include "app.h"
-
-#include <stdlib.h>  /* abs() */
 
 /* ===================================================================
  * Hardware port assignments
@@ -55,9 +96,9 @@
  * Measure on your surface and adjust these values accordingly.
  * =================================================================== */
 
-#define BLACK_VALUE   10   /**< Reflected-light reading on the black line  */
-#define WHITE_VALUE   70   /**< Reflected-light reading on the white surface */
-#define THRESHOLD     ((BLACK_VALUE + WHITE_VALUE) / 2) /**< Line/no-line boundary */
+#define BLACK         10   /**< Reflected-light reading on the black line  */
+#define WHITE         70   /**< Reflected-light reading on the white surface */
+#define THRESHOLD     ((BLACK + WHITE) / 2) /**< Line/no-line boundary */
 
 /* ===================================================================
  * PD control tuning constants
@@ -70,9 +111,9 @@
  * Speed and correction parameters
  * =================================================================== */
 
-#define BASE_SPEED    50    /**< Forward speed when line is centered        */
-#define SIDE_KP       0.35  /**< Proportional gain for side-sensor assist   */
-#define RECOVERY_GAIN 60    /**< Aggressive correction when line is lost    */
+#define BASE_SPEED      50    /**< Forward speed when line is centered      */
+#define SIDE_KP         0.35  /**< Proportional gain for side-sensor assist */
+#define RECOVERY_SPEED  60    /**< Aggressive correction when line is lost  */
 
 /* ===================================================================
  * Timing
@@ -118,13 +159,16 @@ typedef struct {
 /**
  * Read all three color sensors in reflected-light mode.
  *
+ * ev3_color_sensor_get_reflect() returns uint8_t (0..100).
+ * Storing in int is safe and avoids sign-conversion warnings later.
+ *
  * @param[out] sv  Pointer to a sensor_values_t that receives the readings.
  */
 static void read_sensors(sensor_values_t *sv)
 {
-    sv->left   = ev3_color_sensor_get_reflect(LEFT_SENSOR);
-    sv->middle = ev3_color_sensor_get_reflect(MIDDLE_SENSOR);
-    sv->right  = ev3_color_sensor_get_reflect(RIGHT_SENSOR);
+    sv->left   = (int)ev3_color_sensor_get_reflect(LEFT_SENSOR);
+    sv->middle = (int)ev3_color_sensor_get_reflect(MIDDLE_SENSOR);
+    sv->right  = (int)ev3_color_sensor_get_reflect(RIGHT_SENSOR);
 }
 
 /* ===================================================================
@@ -151,23 +195,29 @@ static int compute_correction(const sensor_values_t *sv,
                               int *error_out,
                               int  last_direction)
 {
+    /* All declarations at the top of the block for C89 safety. */
+    int error;
+    double pd;
+    int side_diff;
+    int line_lost;  /* 1 = line completely lost, 0 = at least one sensor sees it */
+    int dir;
     int correction;
 
     /* --- Primary PD control on the middle sensor ---------------------- */
-    int error = sv->middle - THRESHOLD;  /* negative → on black / too far left
-                                            positive → on white / too far right */
+    error = sv->middle - THRESHOLD;  /* negative = on black / too far left
+                                        positive = on white / too far right */
 
     /* Proportional + derivative terms */
-    double pd = KP * error + KD * (error - prev_error);
+    pd = KP * error + KD * (error - prev_error);
 
     /* --- Side-sensor differential for fine-tuning --------------------- */
-    int side_diff = sv->left - sv->right;  /* positive → right sensor darker
-                                              (line to the right) */
+    side_diff = sv->left - sv->right;  /* positive = right sensor darker
+                                          (line to the right) */
 
     /* --- Recovery: all sensors on white (line completely lost) --------- */
-    bool line_lost = (sv->left  > THRESHOLD) &&
-                     (sv->middle > THRESHOLD) &&
-                     (sv->right > THRESHOLD);
+    line_lost = (sv->left   > THRESHOLD) &&
+                (sv->middle > THRESHOLD) &&
+                (sv->right  > THRESHOLD);
 
     if (line_lost) {
         /*
@@ -175,8 +225,8 @@ static int compute_correction(const sensor_values_t *sv,
          * last_direction carries the sign: negative means the line was
          * last seen to the left, positive to the right.
          */
-        int dir = (last_direction >= 0) ? 1 : -1;
-        correction = dir * RECOVERY_GAIN;
+        dir = (last_direction >= 0) ? 1 : -1;
+        correction = dir * RECOVERY_SPEED;
     } else {
         /* Normal operation: PD + side-sensor assist */
         correction = (int)(pd + SIDE_KP * side_diff);
@@ -198,7 +248,7 @@ static int compute_correction(const sensor_values_t *sv,
  *
  * Both values are clamped to [-100, 100].
  *
- * @param correction  Steering correction (positive → turn right).
+ * @param correction  Steering correction (positive = turn right).
  */
 static void apply_motors(int correction)
 {
@@ -215,6 +265,8 @@ static void apply_motors(int correction)
 
 /**
  * Configure all sensors and motors used by the application.
+ *
+ * Must be called before any sensor read or motor write.
  */
 static void init_devices(void)
 {
@@ -233,7 +285,7 @@ static void init_devices(void)
  * =================================================================== */
 
 /**
- * Main control task – entry point called by the EV3RT kernel.
+ * Main control task -- entry point called by the EV3RT kernel.
  *
  * Runs the PD line-following control loop indefinitely.
  *
@@ -241,29 +293,38 @@ static void init_devices(void)
  */
 void main_task(intptr_t exinf)
 {
+    /* All declarations at the top of the block for C89 safety. */
+    int prev_error;
+    int last_direction;
+    sensor_values_t sv;
+
     (void)exinf;  /* Suppress unused-parameter warning */
 
     /* ---- Initialize hardware ---- */
     init_devices();
 
-    /* Allow sensors to settle after configuration */
-    tslp_tsk(500U * 1000U);  /* 500 ms in microseconds */
+    /*
+     * Allow sensors to settle after configuration.
+     * tslp_tsk() takes microseconds in EV3RT (TOPPERS/HRP3).
+     * 500 ms = 500 * 1000 us = 500000 us.
+     */
+    tslp_tsk(500U * 1000U);
 
     /* ---- Control-loop state variables ---- */
-    int prev_error     = 0;   /* Previous cycle error (for derivative)       */
-    int last_direction = 0;   /* Last known line direction for recovery      */
-
-    sensor_values_t sv;
+    prev_error     = 0;   /* Previous cycle error (for derivative)       */
+    last_direction = 0;   /* Last known line direction for recovery      */
 
     /* ---- Main control loop ---- */
     while (1) {
+        int error;
+        int correction;
+
         /* 1. Read all sensors */
         read_sensors(&sv);
 
         /* 2. Compute correction */
-        int error;
-        int correction = compute_correction(&sv, prev_error,
-                                            &error, last_direction);
+        correction = compute_correction(&sv, prev_error,
+                                        &error, last_direction);
 
         /* 3. Update state for next cycle */
         prev_error = error;
@@ -284,7 +345,8 @@ void main_task(intptr_t exinf)
         /* 4. Drive motors */
         apply_motors(correction);
 
-        /* 5. Wait to maintain a consistent loop period */
-        tslp_tsk(LOOP_DELAY_MS * 1000U);  /* Convert ms → µs */
+        /* 5. Wait to maintain a consistent loop period.
+         *    LOOP_DELAY_MS * 1000U converts milliseconds to microseconds. */
+        tslp_tsk(LOOP_DELAY_MS * 1000U);
     }
 }
